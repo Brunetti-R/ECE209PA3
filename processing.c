@@ -15,6 +15,12 @@
 
 #include "miniz-3.1.1/miniz.h"
 
+typedef struct LanguageCountNode {
+    char *language;
+    int count;
+    struct LanguageCountNode *next;
+} LanguageCountNode;
+
 /* Internal helpers (file-local only). */
 static void clear_review(review *r);
 static char *copy_csv_field(const char *start, int len);
@@ -25,6 +31,34 @@ static GameNode *create_game_node(const review *source_review);
 static GameNode *get_or_create_game_node(const review *source_review);
 static void update_game_from_review(GameNode *game, const review *source_review);
 static GameNode *clone_game_node(const GameNode *source);
+static int ascii_casecmp(const char *a, const char *b);
+static int str_ends_with_case_insensitive(const char *text, const char *suffix);
+static int is_macos_metadata_entry(const char *filename);
+static char *read_file_into_heap(const char *path, size_t *out_size);
+static char *load_text_with_fallbacks(
+    const char *preferred_name,
+    const char *const *fallback_names,
+    int fallback_count,
+    size_t *out_size
+);
+static int open_zip_with_fallbacks(mz_zip_archive *zip, const char *preferred_name);
+static int find_csv_index_in_zip(mz_zip_archive *zip, const char *preferred_name);
+static char *load_csv_text_for_passes(const char *csvfilename, size_t *out_size);
+static int push_review_count(WinnerStats *stats, int value);
+static LanguageCountNode *find_or_create_language(LanguageCountNode **head, const char *language);
+static void free_language_list(LanguageCountNode *head);
+static char *title_case_copy(const char *text);
+static char *choose_min_language(const LanguageCountNode *head);
+static int compare_int_ascending(const void *a, const void *b);
+static double compute_median_from_sorted(const int *values, int count);
+static const char *skip_ws(const char *p);
+static const char *find_json_object_start(const char *json, int target_app_id);
+static const char *find_matching_closing_brace(const char *open_brace);
+static const char *find_json_value_in_object(const char *obj_start, const char *obj_end, const char *field_name);
+static char *parse_json_string_value(const char *value_start, const char *obj_end);
+static int parse_json_bool_value(const char *value_start, const char *obj_end, int *out_value);
+static int parse_json_number_value(const char *value_start, const char *obj_end, double *out_value);
+static char *format_platforms(int supports_windows, int supports_mac, int supports_linux);
 /* static void debug_print_review_and_game(const review *source_review, const GameNode *game); */
 
 #define HASH_BUCKET_COUNT 4096
@@ -39,6 +73,783 @@ static char *dup_str(const char *s) {
     }
     memcpy(out, s, len);
     return out;
+}
+
+/* Case-insensitive ASCII string compare similar to strcasecmp. */
+static int ascii_casecmp(const char *a, const char *b) {
+    if (a == NULL && b == NULL) {
+        return 0;
+    }
+    if (a == NULL) {
+        return -1;
+    }
+    if (b == NULL) {
+        return 1;
+    }
+
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        int la = tolower(ca);
+        int lb = tolower(cb);
+
+        if (la != lb) {
+            return (la < lb) ? -1 : 1;
+        }
+        a++;
+        b++;
+    }
+
+    if (*a == *b) {
+        return 0;
+    }
+    return (*a == '\0') ? -1 : 1;
+}
+
+/* True when text ends with suffix, ignoring case. */
+static int str_ends_with_case_insensitive(const char *text, const char *suffix) {
+    size_t text_len;
+    size_t suffix_len;
+
+    if (text == NULL || suffix == NULL) {
+        return 0;
+    }
+
+    text_len = strlen(text);
+    suffix_len = strlen(suffix);
+    if (suffix_len > text_len) {
+        return 0;
+    }
+
+    return ascii_casecmp(text + (text_len - suffix_len), suffix) == 0;
+}
+
+/* Filters out macOS zip metadata entries such as __MACOSX and ._ files. */
+static int is_macos_metadata_entry(const char *filename) {
+    const char *base;
+
+    if (filename == NULL || filename[0] == '\0') {
+        return 1;
+    }
+
+    if (strncmp(filename, "__MACOSX/", 9) == 0) {
+        return 1;
+    }
+
+    base = strrchr(filename, '/');
+    base = (base != NULL) ? base + 1 : filename;
+
+    if (base[0] == '.' && base[1] == '_') {
+        return 1;
+    }
+    return 0;
+}
+
+/* Reads an entire file into heap memory and NUL-terminates the buffer. */
+static char *read_file_into_heap(const char *path, size_t *out_size) {
+    FILE *fp;
+    long file_size_long;
+    size_t file_size;
+    size_t read_count;
+    char *buffer;
+
+    if (out_size != NULL) {
+        *out_size = 0;
+    }
+    if (path == NULL) {
+        return NULL;
+    }
+
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    file_size_long = ftell(fp);
+    if (file_size_long < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    file_size = (size_t)file_size_long;
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    buffer = (char *)malloc(file_size + 1);
+    if (buffer == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+
+    read_count = fread(buffer, 1, file_size, fp);
+    fclose(fp);
+    if (read_count != file_size) {
+        free(buffer);
+        return NULL;
+    }
+
+    buffer[file_size] = '\0';
+    if (out_size != NULL) {
+        *out_size = file_size;
+    }
+    return buffer;
+}
+
+/* Loads text from preferred/fallback names across common relative directories. */
+static char *load_text_with_fallbacks(
+    const char *preferred_name,
+    const char *const *fallback_names,
+    int fallback_count,
+    size_t *out_size
+) {
+    const char *prefixes[] = {"", "../", "../../"};
+    const int prefix_count = (int)(sizeof(prefixes) / sizeof(prefixes[0]));
+    const char *candidate_names[16];
+    int candidate_count = 0;
+    int i;
+    int j;
+
+    if (out_size != NULL) {
+        *out_size = 0;
+    }
+
+    if (preferred_name != NULL && preferred_name[0] != '\0') {
+        candidate_names[candidate_count++] = preferred_name;
+    }
+
+    for (i = 0; i < fallback_count && candidate_count < 16; i++) {
+        int duplicate = 0;
+        const char *name = fallback_names[i];
+        int k;
+
+        if (name == NULL || name[0] == '\0') {
+            continue;
+        }
+
+        for (k = 0; k < candidate_count; k++) {
+            if (ascii_casecmp(name, candidate_names[k]) == 0) {
+                duplicate = 1;
+                break;
+            }
+        }
+
+        if (!duplicate) {
+            candidate_names[candidate_count++] = name;
+        }
+    }
+
+    for (i = 0; i < candidate_count; i++) {
+        for (j = 0; j < prefix_count; j++) {
+            char path[1024];
+            char *loaded;
+
+            snprintf(path, sizeof(path), "%s%s", prefixes[j], candidate_names[i]);
+            loaded = read_file_into_heap(path, out_size);
+            if (loaded != NULL) {
+                return loaded;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/* Opens a zip archive by trying preferred and fallback names/paths. */
+static int open_zip_with_fallbacks(mz_zip_archive *zip, const char *preferred_name) {
+    const char *prefixes[] = {"", "../", "../../"};
+    const int prefix_count = (int)(sizeof(prefixes) / sizeof(prefixes[0]));
+    const char *fallback_names[] = {"data.zip", "test.zip", "Test.zip"};
+    const int fallback_count = (int)(sizeof(fallback_names) / sizeof(fallback_names[0]));
+    const char *candidate_names[8];
+    int candidate_count = 0;
+    int i;
+    int j;
+
+    if (zip == NULL) {
+        return 0;
+    }
+
+    if (preferred_name != NULL && preferred_name[0] != '\0') {
+        candidate_names[candidate_count++] = preferred_name;
+    }
+
+    for (i = 0; i < fallback_count && candidate_count < 8; i++) {
+        int duplicate = 0;
+        int k;
+
+        for (k = 0; k < candidate_count; k++) {
+            if (ascii_casecmp(fallback_names[i], candidate_names[k]) == 0) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (!duplicate) {
+            candidate_names[candidate_count++] = fallback_names[i];
+        }
+    }
+
+    for (i = 0; i < candidate_count; i++) {
+        for (j = 0; j < prefix_count; j++) {
+            char path[1024];
+
+            snprintf(path, sizeof(path), "%s%s", prefixes[j], candidate_names[i]);
+            if (mz_zip_reader_init_file(zip, path, 0)) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* Finds the best CSV entry in an opened zip archive. */
+static int find_csv_index_in_zip(mz_zip_archive *zip, const char *preferred_name) {
+    int index = -1;
+
+    if (zip == NULL) {
+        return -1;
+    }
+
+    if (preferred_name != NULL && preferred_name[0] != '\0') {
+        index = mz_zip_reader_locate_file(zip, preferred_name, NULL, MZ_ZIP_FLAG_IGNORE_PATH);
+    }
+    if (index < 0) {
+        index = mz_zip_reader_locate_file(zip, "data.csv", NULL, MZ_ZIP_FLAG_IGNORE_PATH);
+    }
+    if (index < 0) {
+        index = mz_zip_reader_locate_file(zip, "Test.csv", NULL, MZ_ZIP_FLAG_IGNORE_PATH);
+    }
+    if (index < 0) {
+        index = mz_zip_reader_locate_file(zip, "test.csv", NULL, MZ_ZIP_FLAG_IGNORE_PATH);
+    }
+
+    if (index >= 0) {
+        return index;
+    }
+
+    {
+        mz_uint file_count = mz_zip_reader_get_num_files(zip);
+        mz_uint i;
+
+        for (i = 0; i < file_count; i++) {
+            mz_zip_archive_file_stat stat;
+            if (!mz_zip_reader_file_stat(zip, i, &stat)) {
+                continue;
+            }
+            if (stat.m_is_directory || !stat.m_is_supported) {
+                continue;
+            }
+            if (is_macos_metadata_entry(stat.m_filename)) {
+                continue;
+            }
+            if (str_ends_with_case_insensitive(stat.m_filename, ".csv")) {
+                return (int)i;
+            }
+        }
+    }
+
+    return -1;
+}
+
+/* Shared CSV loader for pass one and pass two (zip-first, same parser input). */
+static char *load_csv_text_for_passes(const char *csvfilename, size_t *out_size) {
+    mz_zip_archive zip = {0};
+    void *opened_file = NULL;
+    size_t extracted_size = 0;
+    char *csv_text = NULL;
+    char derived_zip_name[512];
+    const char *zip_hint = NULL;
+    const char *csv_fallback_names[] = {"data.csv", "Test.csv", "test.csv"};
+    const int csv_fallback_count = (int)(sizeof(csv_fallback_names) / sizeof(csv_fallback_names[0]));
+
+    if (out_size != NULL) {
+        *out_size = 0;
+    }
+
+    if (csvfilename != NULL && csvfilename[0] != '\0') {
+        const char *dot = strrchr(csvfilename, '.');
+        if (dot != NULL && ascii_casecmp(dot, ".csv") == 0) {
+            size_t prefix_len = (size_t)(dot - csvfilename);
+            if (prefix_len + 5 < sizeof(derived_zip_name)) {
+                memcpy(derived_zip_name, csvfilename, prefix_len);
+                memcpy(derived_zip_name + prefix_len, ".zip", 5);
+                zip_hint = derived_zip_name;
+            }
+        }
+    }
+
+    if (open_zip_with_fallbacks(&zip, zip_hint)) {
+        int csv_index = find_csv_index_in_zip(&zip, csvfilename);
+        if (csv_index >= 0) {
+            opened_file = mz_zip_reader_extract_to_heap(&zip, (mz_uint)csv_index, &extracted_size, 0);
+            if (opened_file != NULL) {
+                csv_text = (char *)malloc(extracted_size + 1);
+                if (csv_text != NULL) {
+                    memcpy(csv_text, opened_file, extracted_size);
+                    csv_text[extracted_size] = '\0';
+                    if (out_size != NULL) {
+                        *out_size = extracted_size;
+                    }
+                }
+                mz_free(opened_file);
+            }
+        }
+        mz_zip_reader_end(&zip);
+    }
+
+    if (csv_text == NULL) {
+        csv_text = load_text_with_fallbacks(csvfilename, csv_fallback_names, csv_fallback_count, out_size);
+    }
+
+    return csv_text;
+}
+
+/* Appends one reviewer count to the dynamic stats array. */
+static int push_review_count(WinnerStats *stats, int value) {
+    if (stats == NULL) {
+        return 0;
+    }
+
+    if (stats->count_size >= stats->count_capacity) {
+        int new_capacity = (stats->count_capacity > 0) ? (stats->count_capacity * 2) : 128;
+        int *new_buffer = (int *)realloc(stats->reviews_counts, (size_t)new_capacity * sizeof(int));
+        if (new_buffer == NULL) {
+            return 0;
+        }
+        stats->reviews_counts = new_buffer;
+        stats->count_capacity = new_capacity;
+    }
+
+    stats->reviews_counts[stats->count_size++] = value;
+    return 1;
+}
+
+/* Finds/creates a language counter node, normalized to lowercase ASCII. */
+static LanguageCountNode *find_or_create_language(LanguageCountNode **head, const char *language) {
+    LanguageCountNode *node;
+    char *normalized;
+    size_t raw_len;
+    size_t begin = 0;
+    size_t end;
+    size_t i;
+
+    if (head == NULL || language == NULL) {
+        return NULL;
+    }
+
+    raw_len = strlen(language);
+    while (begin < raw_len && isspace((unsigned char)language[begin])) {
+        begin++;
+    }
+    end = raw_len;
+    while (end > begin && isspace((unsigned char)language[end - 1])) {
+        end--;
+    }
+    if (end <= begin) {
+        return NULL;
+    }
+
+    normalized = (char *)malloc((end - begin) + 1);
+    if (normalized == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < end - begin; i++) {
+        normalized[i] = (char)tolower((unsigned char)language[begin + i]);
+    }
+    normalized[end - begin] = '\0';
+
+    node = *head;
+    while (node != NULL) {
+        if (strcmp(node->language, normalized) == 0) {
+            node->count++;
+            free(normalized);
+            return node;
+        }
+        node = node->next;
+    }
+
+    node = (LanguageCountNode *)calloc(1, sizeof(LanguageCountNode));
+    if (node == NULL) {
+        free(normalized);
+        return NULL;
+    }
+
+    node->language = normalized;
+    node->count = 1;
+    node->next = *head;
+    *head = node;
+    return node;
+}
+
+/* Frees all nodes in the temporary language linked list. */
+static void free_language_list(LanguageCountNode *head) {
+    LanguageCountNode *node = head;
+
+    while (node != NULL) {
+        LanguageCountNode *next = node->next;
+        free(node->language);
+        free(node);
+        node = next;
+    }
+}
+
+/* Converts a string to title case for display output. */
+static char *title_case_copy(const char *text) {
+    char *out;
+    int new_word = 1;
+    size_t i;
+
+    if (text == NULL) {
+        return dup_str("Unknown");
+    }
+
+    out = dup_str(text);
+    if (out == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; out[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)out[i];
+        if (isalpha(c)) {
+            out[i] = (char)(new_word ? toupper(c) : tolower(c));
+            new_word = 0;
+        } else {
+            out[i] = (char)c;
+            new_word = (c == ' ' || c == '-' || c == '_' || c == '/' || c == '.');
+        }
+    }
+
+    return out;
+}
+
+/* Chooses the least frequent language with lexical tie-break. */
+static char *choose_min_language(const LanguageCountNode *head) {
+    const LanguageCountNode *best = NULL;
+    const LanguageCountNode *node = head;
+
+    while (node != NULL) {
+        if (best == NULL ||
+            node->count < best->count ||
+            (node->count == best->count && strcmp(node->language, best->language) < 0)) {
+            best = node;
+        }
+        node = node->next;
+    }
+
+    if (best == NULL) {
+        return dup_str("Unknown");
+    }
+    return title_case_copy(best->language);
+}
+
+/* qsort comparator for integer ascending order. */
+static int compare_int_ascending(const void *a, const void *b) {
+    int lhs = *(const int *)a;
+    int rhs = *(const int *)b;
+
+    if (lhs < rhs) {
+        return -1;
+    }
+    if (lhs > rhs) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Computes median from an already sorted integer array. */
+static double compute_median_from_sorted(const int *values, int count) {
+    if (values == NULL || count <= 0) {
+        return 0.0;
+    }
+
+    if ((count % 2) == 1) {
+        return (double)values[count / 2];
+    }
+
+    return ((double)values[(count / 2) - 1] + (double)values[count / 2]) / 2.0;
+}
+
+/* Skips ASCII whitespace in a NUL-terminated string. */
+static const char *skip_ws(const char *p) {
+    while (p != NULL && *p != '\0' && isspace((unsigned char)*p)) {
+        p++;
+    }
+    return p;
+}
+
+/* Finds the '{' that starts the object for a target app id key. */
+static const char *find_json_object_start(const char *json, int target_app_id) {
+    char key[64];
+    const char *search;
+    int key_len;
+
+    if (json == NULL || target_app_id <= 0) {
+        return NULL;
+    }
+
+    if (snprintf(key, sizeof(key), "\"%d\"", target_app_id) <= 0) {
+        return NULL;
+    }
+    key_len = (int)strlen(key);
+    search = json;
+
+    while (search != NULL && *search != '\0') {
+        const char *hit = strstr(search, key);
+        const char *cursor;
+
+        if (hit == NULL) {
+            break;
+        }
+
+        cursor = skip_ws(hit + key_len);
+        if (cursor != NULL && *cursor == ':') {
+            cursor = skip_ws(cursor + 1);
+            if (cursor != NULL && *cursor == '{') {
+                return cursor;
+            }
+        }
+
+        search = hit + 1;
+    }
+
+    return NULL;
+}
+
+/* Returns the matching closing brace for an object start. */
+static const char *find_matching_closing_brace(const char *open_brace) {
+    const char *p;
+    int depth = 0;
+    int in_string = 0;
+
+    if (open_brace == NULL || *open_brace != '{') {
+        return NULL;
+    }
+
+    for (p = open_brace; *p != '\0'; p++) {
+        if (in_string) {
+            if (*p == '\\') {
+                if (*(p + 1) != '\0') {
+                    p++;
+                }
+                continue;
+            }
+            if (*p == '"') {
+                in_string = 0;
+            }
+            continue;
+        }
+
+        if (*p == '"') {
+            in_string = 1;
+        } else if (*p == '{') {
+            depth++;
+        } else if (*p == '}') {
+            depth--;
+            if (depth == 0) {
+                return p;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/* Finds the value-start pointer for one top-level field inside an object span. */
+static const char *find_json_value_in_object(const char *obj_start, const char *obj_end, const char *field_name) {
+    char pattern[128];
+    const char *search;
+    size_t pattern_len;
+
+    if (obj_start == NULL || obj_end == NULL || field_name == NULL || obj_start >= obj_end) {
+        return NULL;
+    }
+
+    if (snprintf(pattern, sizeof(pattern), "\"%s\"", field_name) <= 0) {
+        return NULL;
+    }
+    pattern_len = strlen(pattern);
+    search = obj_start;
+
+    while (search < obj_end) {
+        const char *hit = strstr(search, pattern);
+        const char *cursor;
+
+        if (hit == NULL || hit >= obj_end) {
+            break;
+        }
+
+        cursor = hit + pattern_len;
+        while (cursor < obj_end && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (cursor < obj_end && *cursor == ':') {
+            cursor++;
+            while (cursor < obj_end && isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (cursor < obj_end) {
+                return cursor;
+            }
+        }
+
+        search = hit + 1;
+    }
+
+    return NULL;
+}
+
+/* Parses one JSON string literal value and returns a decoded copy. */
+static char *parse_json_string_value(const char *value_start, const char *obj_end) {
+    const char *p;
+    const char *src;
+    char *out;
+    char *dst;
+
+    if (value_start == NULL || obj_end == NULL || value_start >= obj_end || *value_start != '"') {
+        return NULL;
+    }
+
+    p = value_start + 1;
+    while (p < obj_end && *p != '\0') {
+        if (*p == '\\') {
+            if ((p + 1) < obj_end) {
+                p += 2;
+                continue;
+            }
+            return NULL;
+        }
+        if (*p == '"') {
+            break;
+        }
+        p++;
+    }
+
+    if (p >= obj_end || *p != '"') {
+        return NULL;
+    }
+
+    out = (char *)malloc((size_t)(p - (value_start + 1)) + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+
+    src = value_start + 1;
+    dst = out;
+    while (src < p) {
+        if (*src == '\\' && (src + 1) < p) {
+            src++;
+            switch (*src) {
+                case '"':  *dst++ = '"';  break;
+                case '\\': *dst++ = '\\'; break;
+                case '/':  *dst++ = '/';  break;
+                case 'b':  *dst++ = '\b'; break;
+                case 'f':  *dst++ = '\f'; break;
+                case 'n':  *dst++ = '\n'; break;
+                case 'r':  *dst++ = '\r'; break;
+                case 't':  *dst++ = '\t'; break;
+                case 'u':
+                    *dst++ = '?';
+                    if ((src + 4) < p) {
+                        src += 4;
+                    }
+                    break;
+                default:
+                    *dst++ = *src;
+                    break;
+            }
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
+/* Parses JSON true/false from a field value pointer. */
+static int parse_json_bool_value(const char *value_start, const char *obj_end, int *out_value) {
+    (void)obj_end;
+
+    if (value_start == NULL || out_value == NULL) {
+        return 0;
+    }
+
+    if (strncmp(value_start, "true", 4) == 0) {
+        *out_value = 1;
+        return 1;
+    }
+    if (strncmp(value_start, "false", 5) == 0) {
+        *out_value = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Parses a JSON numeric field value as double. */
+static int parse_json_number_value(const char *value_start, const char *obj_end, double *out_value) {
+    char *endptr = NULL;
+    double parsed;
+
+    if (value_start == NULL || obj_end == NULL || out_value == NULL) {
+        return 0;
+    }
+
+    parsed = strtod(value_start, &endptr);
+    if (endptr == value_start || endptr == NULL || endptr > obj_end) {
+        return 0;
+    }
+
+    *out_value = parsed;
+    return 1;
+}
+
+/* Formats platform booleans into the required output phrase. */
+static char *format_platforms(int supports_windows, int supports_mac, int supports_linux) {
+    const char *names[3];
+    int count = 0;
+
+    if (supports_windows) {
+        names[count++] = "Windows";
+    }
+    if (supports_mac) {
+        names[count++] = "Mac";
+    }
+    if (supports_linux) {
+        names[count++] = "Linux";
+    }
+
+    if (count == 0) {
+        return dup_str("Unknown");
+    }
+    if (count == 1) {
+        return dup_str(names[0]);
+    }
+    if (count == 2) {
+        size_t len = strlen(names[0]) + strlen(names[1]) + strlen(" and ") + 1;
+        char *out = (char *)malloc(len);
+        if (out == NULL) {
+            return NULL;
+        }
+        snprintf(out, len, "%s and %s", names[0], names[1]);
+        return out;
+    }
+
+    {
+        size_t len = strlen(names[0]) + strlen(names[1]) + strlen(names[2]) + strlen(", , and ") + 1;
+        char *out = (char *)malloc(len);
+        if (out == NULL) {
+            return NULL;
+        }
+        snprintf(out, len, "%s, %s, and %s", names[0], names[1], names[2]);
+        return out;
+    }
 }
 
 /* Builds a default "Unknown" game node used when no winner can be computed. */
@@ -178,9 +989,7 @@ static GameNode *clone_game_node(const GameNode *source) {
 
 /* Parses all reviews, updates hash-table aggregates, and returns the highest-scoring game. */
 GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
-    mz_zip_archive zip = {0};
-    size_t extracted_size = 0;
-    void *opened_file = NULL;
+    (void)zipfilename;
     char *csv_text = NULL;
     review current_review;
     char *parse_ptr;
@@ -192,43 +1001,9 @@ GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
     /* Rebuild hash table from scratch each pass. */
     free_hash_table();
 
-    if (zipfilename != NULL && csvfilename != NULL) {
-        char fallback1[512];
-        char fallback2[512];
-        int zip_opened = 0;
-
-        if (mz_zip_reader_init_file(&zip, zipfilename, 0)) {
-            zip_opened = 1;
-        } else {
-            snprintf(fallback1, sizeof(fallback1), "../%s", zipfilename);
-            if (mz_zip_reader_init_file(&zip, fallback1, 0)) {
-                zip_opened = 1;
-            } else {
-                snprintf(fallback2, sizeof(fallback2), "../../%s", zipfilename);
-                if (mz_zip_reader_init_file(&zip, fallback2, 0)) {
-                    zip_opened = 1;
-                }
-            }
-        }
-
-        if (zip_opened) {
-        opened_file = mz_zip_reader_extract_file_to_heap(&zip, csvfilename, &extracted_size, 0);
-        if (opened_file != NULL) {
-            csv_text = (char *)malloc(extracted_size + 1);
-            if (csv_text != NULL) {
-                memcpy(csv_text, opened_file, extracted_size);
-                csv_text[extracted_size] = '\0';
-            }
-            mz_free(opened_file);
-        }
-        mz_zip_reader_end(&zip);
-        } else {
-            fprintf(stderr, "Warning: failed to open zip file '%s'.\n",
-                    zipfilename != NULL ? zipfilename : "(null)");
-        }
-    } else {
-        fprintf(stderr, "Warning: failed to open zip file '%s'.\n",
-                zipfilename != NULL ? zipfilename : "(null)");
+    csv_text = load_csv_text_for_passes(csvfilename, NULL);
+    if (csv_text == NULL) {
+        fprintf(stderr, "Warning: failed to load CSV data from zip or filesystem.\n");
     }
 
     review_init(&current_review);
@@ -281,26 +1056,120 @@ GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
     return greatestGame;
 }
 
-/* Returns placeholder winner statistics for the second processing pass. */
+/* Computes winner-only stats: mean hours, median reviews, and rarest language. */
 WinnerStats* process_pass_two(const char *filename, int target_app_id) {
-    (void)filename;
-    (void)target_app_id;
-
     WinnerStats *stats = (WinnerStats *)calloc(1, sizeof(WinnerStats));
+    char *csv_text = NULL;
+    char *parse_ptr = NULL;
+    review current_review;
+    LanguageCountNode *language_head = NULL;
+    double total_hours = 0.0;
+    int matching_reviews = 0;
+    int failed = 0;
+
     if (!stats) {
         return NULL;
     }
 
     stats->min_language = dup_str("Unknown");
+    if (stats->min_language == NULL) {
+        free(stats);
+        return NULL;
+    }
+
+    if (target_app_id <= 0) {
+        return stats;
+    }
+
+    csv_text = load_csv_text_for_passes(filename, NULL);
+    if (csv_text == NULL) {
+        return stats;
+    }
+
+    review_init(&current_review);
+    parse_ptr = csv_text;
+    while (csv_parse(&parse_ptr, &current_review)) {
+        if (current_review.app_id != target_app_id) {
+            continue;
+        }
+
+        matching_reviews++;
+        total_hours += current_review.author_total_playtime;
+
+        if (!push_review_count(stats, current_review.author_num_reviews)) {
+            failed = 1;
+            break;
+        }
+
+        if (current_review.language != NULL) {
+            const char *lp = current_review.language;
+            int has_visible_char = 0;
+
+            while (*lp != '\0') {
+                if (!isspace((unsigned char)*lp)) {
+                    has_visible_char = 1;
+                    break;
+                }
+                lp++;
+            }
+
+            if (has_visible_char && find_or_create_language(&language_head, current_review.language) == NULL) {
+                failed = 1;
+                break;
+            }
+        }
+    }
+
+    review_cleanup(&current_review);
+    free(csv_text);
+
+    if (failed) {
+        free_language_list(language_head);
+        free(stats->reviews_counts);
+        free(stats->min_language);
+        free(stats);
+        return NULL;
+    }
+
+    if (matching_reviews > 0) {
+        stats->mean_hours = total_hours / (double)matching_reviews;
+    } else {
+        stats->mean_hours = 0.0;
+    }
+
+    if (stats->count_size > 0) {
+        qsort(stats->reviews_counts, (size_t)stats->count_size, sizeof(stats->reviews_counts[0]), compare_int_ascending);
+        stats->median_reviews = compute_median_from_sorted(stats->reviews_counts, stats->count_size);
+    } else {
+        stats->median_reviews = 0.0;
+    }
+
+    {
+        char *computed_language = choose_min_language(language_head);
+        if (computed_language == NULL) {
+            free_language_list(language_head);
+            free(stats->reviews_counts);
+            free(stats->min_language);
+            free(stats);
+            return NULL;
+        }
+        free(stats->min_language);
+        stats->min_language = computed_language;
+    }
+
+    free_language_list(language_head);
     return stats;
 }
 
-/* Returns placeholder metadata for a game id from the JSON source. */
+/* Loads release date, price, and native platforms for the winner from JSON. */
 GameMetadata* get_game_metadata(const char *json_filename, int target_app_id) {
-    (void)json_filename;
-    (void)target_app_id;
-
     GameMetadata *metadata = (GameMetadata *)calloc(1, sizeof(GameMetadata));
+    const char *json_fallback_names[] = {"gameDescriptions.json", "Test.json", "test.json"};
+    const int json_fallback_count = (int)(sizeof(json_fallback_names) / sizeof(json_fallback_names[0]));
+    char *json_text = NULL;
+    const char *obj_start;
+    const char *obj_end;
+
     if (!metadata) {
         return NULL;
     }
@@ -308,6 +1177,80 @@ GameMetadata* get_game_metadata(const char *json_filename, int target_app_id) {
     metadata->release_date = dup_str("Unknown");
     metadata->price = 0.0;
     metadata->platforms = dup_str("Unknown");
+    if (metadata->release_date == NULL || metadata->platforms == NULL) {
+        free(metadata->release_date);
+        free(metadata->platforms);
+        free(metadata);
+        return NULL;
+    }
+
+    json_text = load_text_with_fallbacks(json_filename, json_fallback_names, json_fallback_count, NULL);
+    if (json_text == NULL || target_app_id <= 0) {
+        free(json_text);
+        return metadata;
+    }
+
+    obj_start = find_json_object_start(json_text, target_app_id);
+    if (obj_start == NULL) {
+        free(json_text);
+        return metadata;
+    }
+
+    obj_end = find_matching_closing_brace(obj_start);
+    if (obj_end == NULL) {
+        free(json_text);
+        return metadata;
+    }
+
+    {
+        const char *value_ptr = find_json_value_in_object(obj_start, obj_end, "release_date");
+        if (value_ptr != NULL) {
+            char *parsed_date = parse_json_string_value(value_ptr, obj_end);
+            if (parsed_date != NULL) {
+                free(metadata->release_date);
+                metadata->release_date = parsed_date;
+            }
+        }
+    }
+
+    {
+        const char *value_ptr = find_json_value_in_object(obj_start, obj_end, "price");
+        double parsed_price = 0.0;
+        if (value_ptr != NULL && parse_json_number_value(value_ptr, obj_end, &parsed_price)) {
+            metadata->price = parsed_price;
+        }
+    }
+
+    {
+        int supports_windows = 0;
+        int supports_mac = 0;
+        int supports_linux = 0;
+        const char *value_ptr;
+        char *parsed_platforms;
+
+        value_ptr = find_json_value_in_object(obj_start, obj_end, "windows");
+        if (value_ptr != NULL) {
+            parse_json_bool_value(value_ptr, obj_end, &supports_windows);
+        }
+
+        value_ptr = find_json_value_in_object(obj_start, obj_end, "mac");
+        if (value_ptr != NULL) {
+            parse_json_bool_value(value_ptr, obj_end, &supports_mac);
+        }
+
+        value_ptr = find_json_value_in_object(obj_start, obj_end, "linux");
+        if (value_ptr != NULL) {
+            parse_json_bool_value(value_ptr, obj_end, &supports_linux);
+        }
+
+        parsed_platforms = format_platforms(supports_windows, supports_mac, supports_linux);
+        if (parsed_platforms != NULL) {
+            free(metadata->platforms);
+            metadata->platforms = parsed_platforms;
+        }
+    }
+
+    free(json_text);
     return metadata;
 }
 

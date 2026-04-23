@@ -1,9 +1,11 @@
 /*
  * File: main.c
  * Project: The Greatest Game Calculator
+ * External source: miniz-3.1.1 (MIT License)
  * AI Assistance Disclosure:
  * This file includes code developed with assistance from OpenAI Codex (GPT-5).
  * All generated content was reviewed and integrated by the project author.
+ * Assisted-by: OpenAI Codex:GPT-5
  */
 
 /* Switch dataset prefix in one place. */
@@ -11,30 +13,11 @@
 
 #define ZIP_FILENAME  FILE_PREFIX ".zip"
 #define CSV_FILENAME  FILE_PREFIX ".csv"
-#define JSON_FILENAME "Test.json"
+#define JSON_FILENAME FILE_PREFIX ".json"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include "processing.h"
-
-/* Prints every field in greatestGame on its own line for debugging. */
-static void debug_print_greatest_game(const GameNode *greatestGame) {
-    if (greatestGame == NULL) {
-        printf("greatestGame: (null)\n");
-        return;
-    }
-
-    printf("greatestGame.app_id: %d\n", greatestGame->app_id);
-    printf("greatestGame.app_name: %s\n",
-           greatestGame->app_name != NULL ? greatestGame->app_name : "Unknown");
-    printf("greatestGame.total_hours: %.3f\n", greatestGame->total_hours);
-    printf("greatestGame.total_recommendations: %d\n", greatestGame->total_recommendations);
-    printf("greatestGame.total_comments: %d\n", greatestGame->total_comments);
-    printf("greatestGame.total_keywords: %d\n", greatestGame->total_keywords);
-    printf("greatestGame.ggs: %.3f\n", greatestGame->ggs);
-    printf("greatestGame.next: %p\n", (void *)greatestGame->next);
-    printf("\n\n");
-}
 
 int main() {
     const char *csv_filename = CSV_FILENAME;
@@ -47,10 +30,6 @@ int main() {
         fprintf(stderr, "Failed to process pass one.\n");
         return EXIT_FAILURE;
     }
-
-    /* DEBUG TEST HOOK: print greatestGame fields */
-    //debug_print_greatest_game(greatestGame);
-    /* END DEBUG TEST HOOK */
 
     // --- Step 2: Detailed Analysis of the Winner ---
     WinnerStats *detailed_stats = process_pass_two(csv_filename, greatestGame->app_id);
@@ -82,7 +61,7 @@ int main() {
 
     } else {
         printf("Release Date: Unknown\n");
-        printf("Price: Unknown\n");
+        printf("Price: $0.00\n");
         printf("Natively supported on Unknown\n");
     }
 
