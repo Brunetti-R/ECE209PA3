@@ -7,7 +7,7 @@
  */
 
 /* Switch dataset prefix in one place. */
-#define FILE_PREFIX "test"
+#define FILE_PREFIX "data"
 
 #define ZIP_FILENAME  FILE_PREFIX ".zip"
 #define CSV_FILENAME  FILE_PREFIX ".csv"
@@ -49,7 +49,7 @@ int main() {
     }
 
     /* DEBUG TEST HOOK: print greatestGame fields */
-    debug_print_greatest_game(greatestGame);
+    //debug_print_greatest_game(greatestGame);
     /* END DEBUG TEST HOOK */
 
     // --- Step 2: Detailed Analysis of the Winner ---
