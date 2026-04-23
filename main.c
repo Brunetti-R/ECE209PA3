@@ -1,15 +1,6 @@
-/* The Greatest Game Calculator
-*
-*  This program decompresses an archive and then processes
-*  the data contained within to determine what was the greatest
-*  game in 2021.
-*
-*  Your Name Here, April 2026
-*  Assisted-by: 
-*  Includes the  library from
-*/
+/* The Greatest Game Calculator */
 
-// macro to make my life ever so slightly easier swaping between file inputs
+/* Switch dataset prefix in one place. */
 #define FILE_PREFIX "test"
 
 #define ZIP_FILENAME  FILE_PREFIX ".zip"
@@ -20,45 +11,88 @@
 #include <stdlib.h>
 #include "processing.h"
 
+/* Prints every field in greatestGame on its own line for debugging. */
+static void debug_print_greatest_game(const GameNode *greatestGame) {
+    if (greatestGame == NULL) {
+        printf("greatestGame: (null)\n");
+        return;
+    }
+
+    printf("greatestGame.app_id: %d\n", greatestGame->app_id);
+    printf("greatestGame.app_name: %s\n",
+           greatestGame->app_name != NULL ? greatestGame->app_name : "Unknown");
+    printf("greatestGame.total_hours: %.3f\n", greatestGame->total_hours);
+    printf("greatestGame.total_recommendations: %d\n", greatestGame->total_recommendations);
+    printf("greatestGame.total_comments: %d\n", greatestGame->total_comments);
+    printf("greatestGame.total_keywords: %d\n", greatestGame->total_keywords);
+    printf("greatestGame.ggs: %.3f\n", greatestGame->ggs);
+    printf("greatestGame.next: %p\n", (void *)greatestGame->next);
+    printf("\n\n");
+}
 
 int main() {
-
-
     const char *csv_filename = CSV_FILENAME;
-    const char *json_filename = "gameDescriptions.json";
+    const char *json_filename = JSON_FILENAME;
     const char *zip_filename = ZIP_FILENAME;
 
-
-    // --- Step 0: Ensure Data Exists ---
-
-
     // --- Step 1: Aggregate Data to find the Greatest Game ---
-    GameNode *winning_game = process_pass_one(zip_filename, csv_filename);
+    GameNode *greatestGame = process_pass_one(zip_filename, csv_filename);
+    if (greatestGame == NULL) {
+        fprintf(stderr, "Failed to process pass one.\n");
+        return EXIT_FAILURE;
+    }
 
+    /* DEBUG TEST HOOK: print greatestGame fields */
+    debug_print_greatest_game(greatestGame);
+    /* END DEBUG TEST HOOK */
 
     // --- Step 2: Detailed Analysis of the Winner ---
-    WinnerStats *detailed_stats = process_pass_two(csv_filename, winning_game->app_id);
+    WinnerStats *detailed_stats = process_pass_two(csv_filename, greatestGame->app_id);
+    if (detailed_stats == NULL) {
+        fprintf(stderr, "Failed to process pass two.\n");
+        free(greatestGame->app_name);
+        free(greatestGame);
+        return EXIT_FAILURE;
+    }
 
     // --- Step 3: Get Metadata from JSON file ---
-    GameMetadata *metadata = get_game_metadata(json_filename, winning_game->app_id);
+    GameMetadata *metadata = get_game_metadata(json_filename, greatestGame->app_id);
 
     // --- Step 4: Output Results ---
-    printf("The Greatest Game Ever: %s\n", winning_game->app_name);
-    printf("GGS: %.3lf\n", winning_game->ggs);
+    printf("The Greatest Game Ever: %s\n",
+           greatestGame->app_name != NULL ? greatestGame->app_name : "Unknown");
+    printf("GGS: %.3lf\n", greatestGame->ggs);
     printf("Average Hours Played: %.0lf hours\n", detailed_stats->mean_hours);
     printf("Median Number of Reviews: %.0lf reviews\n", detailed_stats->median_reviews);
-    printf("Language with Fewest Reviews: %s\n", detailed_stats->min_language);
+    printf("Language with Fewest Reviews: %s\n",
+           detailed_stats->min_language != NULL ? detailed_stats->min_language : "Unknown");
 
     if (metadata) {
-        printf("Release Date: %s\n", metadata->release_date);
+        printf("Release Date: %s\n",
+               metadata->release_date != NULL ? metadata->release_date : "Unknown");
         printf("Price: $%.2f\n", metadata->price);
-        printf("Natively supported on %s\n", metadata->platforms);
+        printf("Natively supported on %s\n",
+               metadata->platforms != NULL ? metadata->platforms : "Unknown");
 
     } else {
         printf("Release Date: Unknown\n");
         printf("Price: Unknown\n");
         printf("Natively supported on Unknown\n");
     }
+
+    free(detailed_stats->reviews_counts);
+    free(detailed_stats->min_language);
+    free(detailed_stats);
+
+    if (metadata != NULL) {
+        free(metadata->release_date);
+        free(metadata->platforms);
+        free(metadata);
+    }
+
+    free(greatestGame->app_name);
+    free(greatestGame);
+    free_hash_table();
 
     return 0;
 }
