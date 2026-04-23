@@ -33,7 +33,7 @@ int main() {
 
 
     // --- Step 1: Aggregate Data to find the Greatest Game ---
-    GameNode *winning_game = process_pass_one(csv_filename);
+    GameNode *winning_game = process_pass_one(zip_filename, csv_filename);
 
 
     // --- Step 2: Detailed Analysis of the Winner ---

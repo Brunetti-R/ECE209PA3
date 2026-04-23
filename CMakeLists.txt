@@ -4,4 +4,5 @@ project(ece209pa3 C)
 set(CMAKE_C_STANDARD 17)
 
 add_executable(ece209pa3 main.c
-        processing.c)
+        processing.c
+        miniz-3.1.1/miniz.c)

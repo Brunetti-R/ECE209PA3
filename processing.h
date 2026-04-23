@@ -4,7 +4,7 @@
 #include "game_structs.h"
 
 // Executes the first pass: reads CSV, builds hash table, finds max GGS.
-GameNode* process_pass_one(const char *filename);
+GameNode* process_pass_one(const char *zipfilename, const char *csvfilename);
 
 // Executes the second pass: reads CSV, filters for app_id, calculates median/language stats.
 WinnerStats* process_pass_two(const char *filename, int target_app_id);

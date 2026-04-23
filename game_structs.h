@@ -36,4 +36,15 @@ typedef struct GameMetadata {
     char *platforms; // Formatted string "Windows, Mac, Linux"
 } GameMetadata;
 
+typedef struct review {
+    int app_id;                  // Game ID used to find or create the matching GameNode
+    char *app_name;              // Heap-allocated UTF-8 game title from the CSV
+    char *language;              // Heap-allocated UTF-8 review language string
+    int keyword_count;           // Total matches of love/laugh/good/fun/awesome in this review
+    int recommended;             // 1 if review says True, 0 if False
+    int comment_count;           // Number of comments on this review
+    int author_num_reviews;      // Reviewer's total number of reviews on Steam
+    double author_total_playtime;// Reviewer's total playtime for this game
+} review;
+
 #endif

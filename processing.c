@@ -1,7 +1,7 @@
 #include "processing.h"
 #include <stdlib.h>
 #include <string.h>
-#include "miniz-3.1.1/"
+#include "miniz-3.1.1/miniz.h"
 /*
  * processing.c
  *
@@ -66,11 +66,21 @@ static char *dup_str(const char *s) {
 
 
 
-GameNode* process_pass_one(const char *filename) {
+GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
     // filename is unused until file parsing is implemented.
-    (void)filename;
 
     // calloc ensures all fields start at zero/NULL before explicit assignment.
+
+    //unzip and open file
+    mz_zip_archive zip = {0};   //special struct for miniz functions
+    size_t extracted_size = 0;
+    if (!mz_zip_reader_init_file(&zip,zipfilename,0)) {
+        printf("failed to open zip file"); return NULL;
+    }  //if failure return NULL pointer
+    void * openedFile = mz_zip_reader_extract_file_to_heap(&zip,csvfilename,&extracted_size,0);
+
+
+
     GameNode *game = (GameNode *)calloc(1, sizeof(GameNode));
     if (!game) {
         return NULL;
@@ -150,5 +160,11 @@ GameMetadata* get_game_metadata(const char *json_filename, int target_app_id) {
  * Current behavior:
  * - No operation, because hash table storage is not yet implemented here.
  */
+review* csvPARSE() {
+
+}
+
+
+
 void free_hash_table() {
 }
