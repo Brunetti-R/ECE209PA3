@@ -8,12 +8,10 @@
  * Assisted-by: OpenAI Codex:GPT-5
  */
 
-/* Switch dataset prefix in one place. */
-#define FILE_PREFIX "data"
-
-#define ZIP_FILENAME  FILE_PREFIX ".zip"
-#define CSV_FILENAME  FILE_PREFIX ".csv"
-#define JSON_FILENAME FILE_PREFIX ".json"
+/* Configure each dataset file explicitly. */
+#define ZIP_FILENAME  "test.zip"
+#define CSV_FILENAME  "Test.csv"
+#define JSON_FILENAME "Test.json"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +30,7 @@ int main() {
     }
 
     // --- Step 2: Detailed Analysis of the Winner ---
-    WinnerStats *detailed_stats = process_pass_two(csv_filename, greatestGame->app_id);
+    WinnerStats *detailed_stats = process_pass_two(zip_filename, csv_filename, greatestGame->app_id);
     if (detailed_stats == NULL) {
         fprintf(stderr, "Failed to process pass two.\n");
         free(greatestGame->app_name);
@@ -42,6 +40,16 @@ int main() {
 
     // --- Step 3: Get Metadata from JSON file ---
     GameMetadata *metadata = get_game_metadata(json_filename, greatestGame->app_id);
+    if (metadata == NULL) {
+        fprintf(stderr, "Failed to load metadata JSON file.\n");
+        free(detailed_stats->reviews_counts);
+        free(detailed_stats->min_language);
+        free(detailed_stats);
+        free(greatestGame->app_name);
+        free(greatestGame);
+        free_hash_table();
+        return EXIT_FAILURE;
+    }
 
     // --- Step 4: Output Results ---
     printf("The Greatest Game Ever: %s\n",
@@ -52,18 +60,11 @@ int main() {
     printf("Language with Fewest Reviews: %s\n",
            detailed_stats->min_language != NULL ? detailed_stats->min_language : "Unknown");
 
-    if (metadata) {
-        printf("Release Date: %s\n",
-               metadata->release_date != NULL ? metadata->release_date : "Unknown");
-        printf("Price: $%.2f\n", metadata->price);
-        printf("Natively supported on %s\n",
-               metadata->platforms != NULL ? metadata->platforms : "Unknown");
-
-    } else {
-        printf("Release Date: Unknown\n");
-        printf("Price: $0.00\n");
-        printf("Natively supported on Unknown\n");
-    }
+    printf("Release Date: %s\n",
+           metadata->release_date != NULL ? metadata->release_date : "Unknown");
+    printf("Price: $%.2f\n", metadata->price);
+    printf("Natively supported on %s\n",
+           metadata->platforms != NULL ? metadata->platforms : "Unknown");
 
     free(detailed_stats->reviews_counts);
     free(detailed_stats->min_language);

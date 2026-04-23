@@ -32,18 +32,11 @@ static GameNode *get_or_create_game_node(const review *source_review);
 static void update_game_from_review(GameNode *game, const review *source_review);
 static GameNode *clone_game_node(const GameNode *source);
 static int ascii_casecmp(const char *a, const char *b);
-static int str_ends_with_case_insensitive(const char *text, const char *suffix);
-static int is_macos_metadata_entry(const char *filename);
-static char *read_file_into_heap(const char *path, size_t *out_size);
-static char *load_text_with_fallbacks(
-    const char *preferred_name,
-    const char *const *fallback_names,
-    int fallback_count,
-    size_t *out_size
-);
-static int open_zip_with_fallbacks(mz_zip_archive *zip, const char *preferred_name);
+static char *read_file_into_heap(const char *path);
+static int open_data_zip(mz_zip_archive *zip, const char *zipfilename);
 static int find_csv_index_in_zip(mz_zip_archive *zip, const char *preferred_name);
-static char *load_csv_text_for_passes(const char *csvfilename, size_t *out_size);
+static char *load_csv_text_for_passes(const char *zipfilename, const char *csvfilename);
+static char *load_json_text(const char *json_filename);
 static int push_review_count(WinnerStats *stats, int value);
 static LanguageCountNode *find_or_create_language(LanguageCountNode **head, const char *language);
 static void free_language_list(LanguageCountNode *head);
@@ -59,7 +52,6 @@ static char *parse_json_string_value(const char *value_start, const char *obj_en
 static int parse_json_bool_value(const char *value_start, const char *obj_end, int *out_value);
 static int parse_json_number_value(const char *value_start, const char *obj_end, double *out_value);
 static char *format_platforms(int supports_windows, int supports_mac, int supports_linux);
-/* static void debug_print_review_and_game(const review *source_review, const GameNode *game); */
 
 #define HASH_BUCKET_COUNT 4096
 static GameNode *g_game_table[HASH_BUCKET_COUNT];
@@ -106,56 +98,14 @@ static int ascii_casecmp(const char *a, const char *b) {
     return (*a == '\0') ? -1 : 1;
 }
 
-/* True when text ends with suffix, ignoring case. */
-static int str_ends_with_case_insensitive(const char *text, const char *suffix) {
-    size_t text_len;
-    size_t suffix_len;
-
-    if (text == NULL || suffix == NULL) {
-        return 0;
-    }
-
-    text_len = strlen(text);
-    suffix_len = strlen(suffix);
-    if (suffix_len > text_len) {
-        return 0;
-    }
-
-    return ascii_casecmp(text + (text_len - suffix_len), suffix) == 0;
-}
-
-/* Filters out macOS zip metadata entries such as __MACOSX and ._ files. */
-static int is_macos_metadata_entry(const char *filename) {
-    const char *base;
-
-    if (filename == NULL || filename[0] == '\0') {
-        return 1;
-    }
-
-    if (strncmp(filename, "__MACOSX/", 9) == 0) {
-        return 1;
-    }
-
-    base = strrchr(filename, '/');
-    base = (base != NULL) ? base + 1 : filename;
-
-    if (base[0] == '.' && base[1] == '_') {
-        return 1;
-    }
-    return 0;
-}
-
 /* Reads an entire file into heap memory and NUL-terminates the buffer. */
-static char *read_file_into_heap(const char *path, size_t *out_size) {
+static char *read_file_into_heap(const char *path) {
     FILE *fp;
     long file_size_long;
     size_t file_size;
     size_t read_count;
     char *buffer;
 
-    if (out_size != NULL) {
-        *out_size = 0;
-    }
     if (path == NULL) {
         return NULL;
     }
@@ -196,219 +146,94 @@ static char *read_file_into_heap(const char *path, size_t *out_size) {
     }
 
     buffer[file_size] = '\0';
-    if (out_size != NULL) {
-        *out_size = file_size;
-    }
     return buffer;
 }
 
-/* Loads text from preferred/fallback names across common relative directories. */
-static char *load_text_with_fallbacks(
-    const char *preferred_name,
-    const char *const *fallback_names,
-    int fallback_count,
-    size_t *out_size
-) {
-    const char *prefixes[] = {"", "../", "../../"};
-    const int prefix_count = (int)(sizeof(prefixes) / sizeof(prefixes[0]));
-    const char *candidate_names[16];
-    int candidate_count = 0;
-    int i;
-    int j;
-
-    if (out_size != NULL) {
-        *out_size = 0;
-    }
-
-    if (preferred_name != NULL && preferred_name[0] != '\0') {
-        candidate_names[candidate_count++] = preferred_name;
-    }
-
-    for (i = 0; i < fallback_count && candidate_count < 16; i++) {
-        int duplicate = 0;
-        const char *name = fallback_names[i];
-        int k;
-
-        if (name == NULL || name[0] == '\0') {
-            continue;
-        }
-
-        for (k = 0; k < candidate_count; k++) {
-            if (ascii_casecmp(name, candidate_names[k]) == 0) {
-                duplicate = 1;
-                break;
-            }
-        }
-
-        if (!duplicate) {
-            candidate_names[candidate_count++] = name;
-        }
-    }
-
-    for (i = 0; i < candidate_count; i++) {
-        for (j = 0; j < prefix_count; j++) {
-            char path[1024];
-            char *loaded;
-
-            snprintf(path, sizeof(path), "%s%s", prefixes[j], candidate_names[i]);
-            loaded = read_file_into_heap(path, out_size);
-            if (loaded != NULL) {
-                return loaded;
-            }
-        }
-    }
-
-    return NULL;
-}
-
-/* Opens a zip archive by trying preferred and fallback names/paths. */
-static int open_zip_with_fallbacks(mz_zip_archive *zip, const char *preferred_name) {
-    const char *prefixes[] = {"", "../", "../../"};
-    const int prefix_count = (int)(sizeof(prefixes) / sizeof(prefixes[0]));
-    const char *fallback_names[] = {"data.zip", "test.zip", "Test.zip"};
-    const int fallback_count = (int)(sizeof(fallback_names) / sizeof(fallback_names[0]));
-    const char *candidate_names[8];
-    int candidate_count = 0;
-    int i;
-    int j;
-
-    if (zip == NULL) {
+/* Opens the exact configured zip archive path. */
+static int open_data_zip(mz_zip_archive *zip, const char *zipfilename) {
+    if (zip == NULL || zipfilename == NULL || zipfilename[0] == '\0') {
         return 0;
     }
 
-    if (preferred_name != NULL && preferred_name[0] != '\0') {
-        candidate_names[candidate_count++] = preferred_name;
-    }
-
-    for (i = 0; i < fallback_count && candidate_count < 8; i++) {
-        int duplicate = 0;
-        int k;
-
-        for (k = 0; k < candidate_count; k++) {
-            if (ascii_casecmp(fallback_names[i], candidate_names[k]) == 0) {
-                duplicate = 1;
-                break;
-            }
-        }
-        if (!duplicate) {
-            candidate_names[candidate_count++] = fallback_names[i];
-        }
-    }
-
-    for (i = 0; i < candidate_count; i++) {
-        for (j = 0; j < prefix_count; j++) {
-            char path[1024];
-
-            snprintf(path, sizeof(path), "%s%s", prefixes[j], candidate_names[i]);
-            if (mz_zip_reader_init_file(zip, path, 0)) {
-                return 1;
-            }
-        }
-    }
-
-    return 0;
+    return mz_zip_reader_init_file(zip, zipfilename, 0) ? 1 : 0;
 }
 
-/* Finds the best CSV entry in an opened zip archive. */
+/* Finds the exact requested CSV entry in an opened zip archive. */
 static int find_csv_index_in_zip(mz_zip_archive *zip, const char *preferred_name) {
-    int index = -1;
-
-    if (zip == NULL) {
+    if (zip == NULL || preferred_name == NULL || preferred_name[0] == '\0') {
         return -1;
     }
 
-    if (preferred_name != NULL && preferred_name[0] != '\0') {
-        index = mz_zip_reader_locate_file(zip, preferred_name, NULL, MZ_ZIP_FLAG_IGNORE_PATH);
-    }
-    if (index < 0) {
-        index = mz_zip_reader_locate_file(zip, "data.csv", NULL, MZ_ZIP_FLAG_IGNORE_PATH);
-    }
-    if (index < 0) {
-        index = mz_zip_reader_locate_file(zip, "Test.csv", NULL, MZ_ZIP_FLAG_IGNORE_PATH);
-    }
-    if (index < 0) {
-        index = mz_zip_reader_locate_file(zip, "test.csv", NULL, MZ_ZIP_FLAG_IGNORE_PATH);
-    }
-
-    if (index >= 0) {
-        return index;
-    }
-
-    {
-        mz_uint file_count = mz_zip_reader_get_num_files(zip);
-        mz_uint i;
-
-        for (i = 0; i < file_count; i++) {
-            mz_zip_archive_file_stat stat;
-            if (!mz_zip_reader_file_stat(zip, i, &stat)) {
-                continue;
-            }
-            if (stat.m_is_directory || !stat.m_is_supported) {
-                continue;
-            }
-            if (is_macos_metadata_entry(stat.m_filename)) {
-                continue;
-            }
-            if (str_ends_with_case_insensitive(stat.m_filename, ".csv")) {
-                return (int)i;
-            }
-        }
-    }
-
-    return -1;
+    return mz_zip_reader_locate_file(zip, preferred_name, NULL, MZ_ZIP_FLAG_IGNORE_PATH);
 }
 
-/* Shared CSV loader for pass one and pass two (zip-first, same parser input). */
-static char *load_csv_text_for_passes(const char *csvfilename, size_t *out_size) {
+/* Shared CSV loader for pass one and pass two (strict, macro-driven inputs). */
+static char *load_csv_text_for_passes(const char *zipfilename, const char *csvfilename) {
     mz_zip_archive zip = {0};
     void *opened_file = NULL;
     size_t extracted_size = 0;
     char *csv_text = NULL;
-    char derived_zip_name[512];
-    const char *zip_hint = NULL;
-    const char *csv_fallback_names[] = {"data.csv", "Test.csv", "test.csv"};
-    const int csv_fallback_count = (int)(sizeof(csv_fallback_names) / sizeof(csv_fallback_names[0]));
 
-    if (out_size != NULL) {
-        *out_size = 0;
+    if (zipfilename == NULL || zipfilename[0] == '\0') {
+        fprintf(stderr, "Error: ZIP filename is not configured.\n");
+        return NULL;
+    }
+    if (csvfilename == NULL || csvfilename[0] == '\0') {
+        fprintf(stderr, "Error: CSV filename is not configured.\n");
+        return NULL;
     }
 
-    if (csvfilename != NULL && csvfilename[0] != '\0') {
-        const char *dot = strrchr(csvfilename, '.');
-        if (dot != NULL && ascii_casecmp(dot, ".csv") == 0) {
-            size_t prefix_len = (size_t)(dot - csvfilename);
-            if (prefix_len + 5 < sizeof(derived_zip_name)) {
-                memcpy(derived_zip_name, csvfilename, prefix_len);
-                memcpy(derived_zip_name + prefix_len, ".zip", 5);
-                zip_hint = derived_zip_name;
-            }
-        }
+    if (!open_data_zip(&zip, zipfilename)) {
+        fprintf(stderr, "Error: failed to open ZIP file '%s'.\n", zipfilename);
+        return NULL;
     }
 
-    if (open_zip_with_fallbacks(&zip, zip_hint)) {
+    {
         int csv_index = find_csv_index_in_zip(&zip, csvfilename);
-        if (csv_index >= 0) {
-            opened_file = mz_zip_reader_extract_to_heap(&zip, (mz_uint)csv_index, &extracted_size, 0);
-            if (opened_file != NULL) {
-                csv_text = (char *)malloc(extracted_size + 1);
-                if (csv_text != NULL) {
-                    memcpy(csv_text, opened_file, extracted_size);
-                    csv_text[extracted_size] = '\0';
-                    if (out_size != NULL) {
-                        *out_size = extracted_size;
-                    }
-                }
-                mz_free(opened_file);
-            }
+        if (csv_index < 0) {
+            fprintf(stderr, "Error: CSV file '%s' was not found in ZIP '%s'.\n", csvfilename, zipfilename);
+            mz_zip_reader_end(&zip);
+            return NULL;
         }
-        mz_zip_reader_end(&zip);
+
+        opened_file = mz_zip_reader_extract_to_heap(&zip, (mz_uint)csv_index, &extracted_size, 0);
+        if (opened_file == NULL) {
+            fprintf(stderr, "Error: failed to extract CSV file '%s' from ZIP '%s'.\n", csvfilename, zipfilename);
+            mz_zip_reader_end(&zip);
+            return NULL;
+        }
     }
 
+    csv_text = (char *)malloc(extracted_size + 1);
     if (csv_text == NULL) {
-        csv_text = load_text_with_fallbacks(csvfilename, csv_fallback_names, csv_fallback_count, out_size);
+        fprintf(stderr, "Error: out of memory while loading CSV '%s'.\n", csvfilename);
+        mz_free(opened_file);
+        mz_zip_reader_end(&zip);
+        return NULL;
     }
+
+    memcpy(csv_text, opened_file, extracted_size);
+    csv_text[extracted_size] = '\0';
+    mz_free(opened_file);
+    mz_zip_reader_end(&zip);
 
     return csv_text;
+}
+
+/* Loads JSON text from the exact configured path. */
+static char *load_json_text(const char *json_filename) {
+    if (json_filename == NULL || json_filename[0] == '\0') {
+        fprintf(stderr, "Error: JSON filename is not configured.\n");
+        return NULL;
+    }
+
+    {
+        char *json_text = read_file_into_heap(json_filename);
+        if (json_text == NULL) {
+            fprintf(stderr, "Error: failed to open JSON file '%s'.\n", json_filename);
+        }
+        return json_text;
+    }
 }
 
 /* Appends one reviewer count to the dynamic stats array. */
@@ -989,7 +814,6 @@ static GameNode *clone_game_node(const GameNode *source) {
 
 /* Parses all reviews, updates hash-table aggregates, and returns the highest-scoring game. */
 GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
-    (void)zipfilename;
     char *csv_text = NULL;
     review current_review;
     char *parse_ptr;
@@ -1001,9 +825,9 @@ GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
     /* Rebuild hash table from scratch each pass. */
     free_hash_table();
 
-    csv_text = load_csv_text_for_passes(csvfilename, NULL);
+    csv_text = load_csv_text_for_passes(zipfilename, csvfilename);
     if (csv_text == NULL) {
-        fprintf(stderr, "Warning: failed to load CSV data from zip or filesystem.\n");
+        return NULL;
     }
 
     review_init(&current_review);
@@ -1023,9 +847,6 @@ GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
             }
 
             update_game_from_review(game, &current_review);
-            /* DEBUG TEST HOOK: review + updated game node */
-            /* debug_print_review_and_game(&current_review, game); */
-            /* END DEBUG TEST HOOK */
         }
     }
     review_cleanup(&current_review);
@@ -1057,7 +878,7 @@ GameNode* process_pass_one(const char *zipfilename, const char *csvfilename) {
 }
 
 /* Computes winner-only stats: mean hours, median reviews, and rarest language. */
-WinnerStats* process_pass_two(const char *filename, int target_app_id) {
+WinnerStats* process_pass_two(const char *zipfilename, const char *csvfilename, int target_app_id) {
     WinnerStats *stats = (WinnerStats *)calloc(1, sizeof(WinnerStats));
     char *csv_text = NULL;
     char *parse_ptr = NULL;
@@ -1081,9 +902,12 @@ WinnerStats* process_pass_two(const char *filename, int target_app_id) {
         return stats;
     }
 
-    csv_text = load_csv_text_for_passes(filename, NULL);
+    csv_text = load_csv_text_for_passes(zipfilename, csvfilename);
     if (csv_text == NULL) {
-        return stats;
+        free(stats->reviews_counts);
+        free(stats->min_language);
+        free(stats);
+        return NULL;
     }
 
     review_init(&current_review);
@@ -1164,8 +988,6 @@ WinnerStats* process_pass_two(const char *filename, int target_app_id) {
 /* Loads release date, price, and native platforms for the winner from JSON. */
 GameMetadata* get_game_metadata(const char *json_filename, int target_app_id) {
     GameMetadata *metadata = (GameMetadata *)calloc(1, sizeof(GameMetadata));
-    const char *json_fallback_names[] = {"gameDescriptions.json", "Test.json", "test.json"};
-    const int json_fallback_count = (int)(sizeof(json_fallback_names) / sizeof(json_fallback_names[0]));
     char *json_text = NULL;
     const char *obj_start;
     const char *obj_end;
@@ -1184,8 +1006,14 @@ GameMetadata* get_game_metadata(const char *json_filename, int target_app_id) {
         return NULL;
     }
 
-    json_text = load_text_with_fallbacks(json_filename, json_fallback_names, json_fallback_count, NULL);
-    if (json_text == NULL || target_app_id <= 0) {
+    json_text = load_json_text(json_filename);
+    if (json_text == NULL) {
+        free(metadata->release_date);
+        free(metadata->platforms);
+        free(metadata);
+        return NULL;
+    }
+    if (target_app_id <= 0) {
         free(json_text);
         return metadata;
     }
@@ -1512,34 +1340,6 @@ static char *copy_csv_field(const char *start, int len) {
     out[len] = '\0';
     return out;
 }
-
-/* Prints one parsed review and the game aggregate values after its update. */
-#if 0
-static void debug_print_review_and_game(const review *source_review, const GameNode *game) {
-    if (source_review == NULL || game == NULL) {
-        return;
-    }
-
-    printf("[DEBUG][REVIEW] app_id=%d app_name=\"%s\" language=\"%s\" keywords=%d recommended=%d comments=%d author_reviews=%d author_playtime=%.3f\n",
-           source_review->app_id,
-           source_review->app_name != NULL ? source_review->app_name : "Unknown",
-           source_review->language != NULL ? source_review->language : "Unknown",
-           source_review->keyword_count,
-           source_review->recommended,
-           source_review->comment_count,
-           source_review->author_num_reviews,
-           source_review->author_total_playtime);
-
-    printf("[DEBUG][GAME ] app_id=%d app_name=\"%s\" TH=%.3f TR=%d TC=%d TW=%d GGS=%.3f\n",
-           game->app_id,
-           game->app_name != NULL ? game->app_name : "Unknown",
-           game->total_hours,
-           game->total_recommendations,
-           game->total_comments,
-           game->total_keywords,
-           game->ggs);
-}
-#endif
 
 /* Frees all nodes in every hash-table bucket and resets the table to empty. */
 void free_hash_table() {
