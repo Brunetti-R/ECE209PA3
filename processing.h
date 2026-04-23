@@ -1,3 +1,11 @@
+/*
+ * File: processing.h
+ * Project: The Greatest Game Calculator
+ * AI Assistance Disclosure:
+ * This file includes code developed with assistance from OpenAI Codex (GPT-5).
+ * All generated content was reviewed and integrated by the project author.
+ */
+
 #ifndef PROCESSING_H
 #define PROCESSING_H
 
