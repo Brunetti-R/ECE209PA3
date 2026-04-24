@@ -18,7 +18,7 @@ GameNode* process_pass_one(const char *zipfilename, const char *csvfilename);
 WinnerStats* process_pass_two(const char *zipfilename, const char *csvfilename, int target_app_id);
 
 // Reads game metadata from JSON by app id.
-GameMetadata* get_game_metadata(const char *json_filename, int target_app_id);
+GameMetadata* get_game_metadata(const char *zipfilename, const char *json_filename, int target_app_id);
 
 // Parses one CSV record from an in-memory buffer into out_review.
 // out_review must be zero-initialized before first use.

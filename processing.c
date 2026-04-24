@@ -32,11 +32,11 @@ static GameNode *get_or_create_game_node(const review *source_review);
 static void update_game_from_review(GameNode *game, const review *source_review);
 static GameNode *clone_game_node(const GameNode *source);
 static int ascii_casecmp(const char *a, const char *b);
-static char *read_file_into_heap(const char *path);
 static int open_data_zip(mz_zip_archive *zip, const char *zipfilename);
 static int find_csv_index_in_zip(mz_zip_archive *zip, const char *preferred_name);
 static char *load_csv_text_for_passes(const char *zipfilename, const char *csvfilename);
-static char *load_json_text(const char *json_filename);
+static int find_json_index_in_zip(mz_zip_archive *zip, const char *json_name);
+static char *load_json_text(const char *zipfilename, const char *json_filename);
 static int push_review_count(WinnerStats *stats, int value);
 static LanguageCountNode *find_or_create_language(LanguageCountNode **head, const char *language);
 static void free_language_list(LanguageCountNode *head);
@@ -96,57 +96,6 @@ static int ascii_casecmp(const char *a, const char *b) {
         return 0;
     }
     return (*a == '\0') ? -1 : 1;
-}
-
-/* Reads an entire file into heap memory and NUL-terminates the buffer. */
-static char *read_file_into_heap(const char *path) {
-    FILE *fp;
-    long file_size_long;
-    size_t file_size;
-    size_t read_count;
-    char *buffer;
-
-    if (path == NULL) {
-        return NULL;
-    }
-
-    fp = fopen(path, "rb");
-    if (fp == NULL) {
-        return NULL;
-    }
-
-    if (fseek(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
-        return NULL;
-    }
-
-    file_size_long = ftell(fp);
-    if (file_size_long < 0) {
-        fclose(fp);
-        return NULL;
-    }
-    file_size = (size_t)file_size_long;
-
-    if (fseek(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
-        return NULL;
-    }
-
-    buffer = (char *)malloc(file_size + 1);
-    if (buffer == NULL) {
-        fclose(fp);
-        return NULL;
-    }
-
-    read_count = fread(buffer, 1, file_size, fp);
-    fclose(fp);
-    if (read_count != file_size) {
-        free(buffer);
-        return NULL;
-    }
-
-    buffer[file_size] = '\0';
-    return buffer;
 }
 
 /* Opens the exact configured zip archive path. */
@@ -220,20 +169,66 @@ static char *load_csv_text_for_passes(const char *zipfilename, const char *csvfi
     return csv_text;
 }
 
-/* Loads JSON text from the exact configured path. */
-static char *load_json_text(const char *json_filename) {
+/* Finds the exact requested JSON entry in an opened zip archive. */
+static int find_json_index_in_zip(mz_zip_archive *zip, const char *json_name) {
+    if (zip == NULL || json_name == NULL || json_name[0] == '\0') {
+        return -1;
+    }
+
+    return mz_zip_reader_locate_file(zip, json_name, NULL, MZ_ZIP_FLAG_IGNORE_PATH);
+}
+
+/* Loads JSON text from the configured zip entry (strict, macro-driven inputs). */
+static char *load_json_text(const char *zipfilename, const char *json_filename) {
+    mz_zip_archive zip = {0};
+    void *opened_file = NULL;
+    size_t extracted_size = 0;
+    char *json_text = NULL;
+
+    if (zipfilename == NULL || zipfilename[0] == '\0') {
+        fprintf(stderr, "Error: ZIP filename is not configured.\n");
+        return NULL;
+    }
     if (json_filename == NULL || json_filename[0] == '\0') {
         fprintf(stderr, "Error: JSON filename is not configured.\n");
         return NULL;
     }
 
-    {
-        char *json_text = read_file_into_heap(json_filename);
-        if (json_text == NULL) {
-            fprintf(stderr, "Error: failed to open JSON file '%s'.\n", json_filename);
-        }
-        return json_text;
+    if (!open_data_zip(&zip, zipfilename)) {
+        fprintf(stderr, "Error: failed to open ZIP file '%s'.\n", zipfilename);
+        return NULL;
     }
+
+    {
+        int json_index = find_json_index_in_zip(&zip, json_filename);
+        if (json_index < 0) {
+            fprintf(stderr, "Error: JSON file '%s' was not found in ZIP '%s'.\n", json_filename, zipfilename);
+            mz_zip_reader_end(&zip);
+            return NULL;
+        }
+
+        opened_file = mz_zip_reader_extract_to_heap(&zip, (mz_uint)json_index, &extracted_size, 0);
+        if (opened_file == NULL) {
+            fprintf(stderr, "Error: failed to extract JSON file '%s' from ZIP '%s'.\n", json_filename, zipfilename);
+            mz_zip_reader_end(&zip);
+            return NULL;
+        }
+    }
+
+    json_text = (char *)malloc(extracted_size + 1);
+    if (json_text == NULL) {
+        fprintf(stderr, "Error: out of memory while loading JSON '%s'.\n", json_filename);
+        mz_free(opened_file);
+        mz_zip_reader_end(&zip);
+        return NULL;
+    }
+
+    memcpy(json_text, opened_file, extracted_size);
+    json_text[extracted_size] = '\0';
+    mz_free(opened_file);
+    mz_zip_reader_end(&zip);
+
+    return json_text;
 }
 
 /* Appends one reviewer count to the dynamic stats array. */
@@ -986,7 +981,7 @@ WinnerStats* process_pass_two(const char *zipfilename, const char *csvfilename, 
 }
 
 /* Loads release date, price, and native platforms for the winner from JSON. */
-GameMetadata* get_game_metadata(const char *json_filename, int target_app_id) {
+GameMetadata* get_game_metadata(const char *zipfilename, const char *json_filename, int target_app_id) {
     GameMetadata *metadata = (GameMetadata *)calloc(1, sizeof(GameMetadata));
     char *json_text = NULL;
     const char *obj_start;
@@ -1006,7 +1001,7 @@ GameMetadata* get_game_metadata(const char *json_filename, int target_app_id) {
         return NULL;
     }
 
-    json_text = load_json_text(json_filename);
+    json_text = load_json_text(zipfilename, json_filename);
     if (json_text == NULL) {
         free(metadata->release_date);
         free(metadata->platforms);

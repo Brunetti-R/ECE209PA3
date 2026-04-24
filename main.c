@@ -8,7 +8,6 @@
  * Assisted-by: OpenAI Codex:GPT-5
  */
 
-/* Configure each dataset file explicitly. */
 #define ZIP_FILENAME  "test.zip"
 #define CSV_FILENAME  "Test.csv"
 #define JSON_FILENAME "Test.json"
@@ -39,7 +38,7 @@ int main() {
     }
 
     // --- Step 3: Get Metadata from JSON file ---
-    GameMetadata *metadata = get_game_metadata(json_filename, greatestGame->app_id);
+    GameMetadata *metadata = get_game_metadata(zip_filename, json_filename, greatestGame->app_id);
     if (metadata == NULL) {
         fprintf(stderr, "Failed to load metadata JSON file.\n");
         free(detailed_stats->reviews_counts);
